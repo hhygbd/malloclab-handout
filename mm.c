@@ -36,6 +36,7 @@ team_t team = {
 };
 
 static char *heap_listp = NULL;
+static char *rover = NULL;      /* 下次适配的起始查找位置 */
 static void place(void *bp, size_t asize);
 static void *coalesce(void *bp);
 static void *extend_heap(size_t words);
@@ -76,34 +77,65 @@ static void *find_fit(size_t asize);
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
+void print_heap() {
+    char *bp = heap_listp;
+    printf("=== HEAP ===\n");
+    int count = 0;
+    while (GET_SIZE(HDRP(bp)) > 0) {
+        size_t size = GET_SIZE(HDRP(bp));
+        int alloc = GET_ALLOC(HDRP(bp));
+        printf("block %d: bp=%p, size=%zu, alloc=%d\n", count, bp, size, alloc);
+        bp = NEXT_BLKP(bp);
+        count++;
+        if (count > 100) { printf("too many blocks, stopping\n"); break; }
+    }
+    printf("end of heap\n");
+}
+
 static void *coalesce(void *bp)
 {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
-    if(prev_alloc && next_alloc){                   /* Case 1 */
-        return bp;
-    }
-    else if(prev_alloc && !next_alloc){             /* Case 2 */
-        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    char *new_bp = bp;
+
+    if (prev_alloc && next_alloc) {
+        /* Case 1: 前后都分配，不合并 */
+        new_bp = bp;
+        /* rover 不变 */
+    } else if (prev_alloc && !next_alloc) {
+        /* Case 2: 向后合并 */
+        char *next = NEXT_BLKP(bp);        /* 必须在修改 bp 的 header 之前保存 */
+        size += GET_SIZE(HDRP(next));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
-    }
-    else if(!prev_alloc && next_alloc){             /* Case 3 */
+        new_bp = bp;
+        if (rover == next) {               /* 用保存下来的地址比对 */
+            rover = new_bp;
+        }
+
+    } else if (!prev_alloc && next_alloc) {
+        /* Case 3: 向前合并 */
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(bp), PACK(size, 0));
-        bp = PREV_BLKP(bp);
-    }
-    else{                                           /* Case 4 */
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + 
-                GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
+        new_bp = PREV_BLKP(bp);
+        if (rover == bp) {
+            rover = new_bp;
+        }
+    } else {
+        /* Case 4: 双向合并 */
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-        bp = PREV_BLKP(bp);
+        PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
+        new_bp = PREV_BLKP(bp);
+        if (rover == bp || rover == NEXT_BLKP(bp) || rover == PREV_BLKP(bp)) {
+            rover = new_bp;
+        }
     }
-    return bp;
+
+    return new_bp;
 }
 
 static void *extend_heap(size_t words)
@@ -128,35 +160,63 @@ static void *extend_heap(size_t words)
 
 }
 
-/* First-fit search */
+
 static void *find_fit(size_t asize){
 
-    char *bp;
+    if (rover == NULL) rover = heap_listp;
 
+    char *old_rover = rover;
+    char *bp = rover;
+    
+    /* 从 rover 开始遍历 */
+    for(; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
+
+        if(!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))){
+            rover = bp;
+            return bp;
+        }
+
+    }
+
+    /* 从 rover 到结尾没找到，回绕到 heap_listp 重新找 */
+    for(bp = heap_listp; bp != old_rover && GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
+
+        if(!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))){
+            rover = bp;
+            return bp;
+        }
+        
+    }
+
+    /* 没找到 */
+    return NULL;
+
+    /* First-fit search 
     for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
         if(!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))){
             return bp;
         }
     }
-
-    return NULL;/* No fit */
+    return NULL;   No fit */
 }
 
 static void place(void *bp, size_t asize){
 
+    //printf("place: bp=%p, asize=%zu\n", bp, asize);
     size_t csize = GET_SIZE(HDRP(bp));
 
-    if((csize - asize) >= (2 * DSIZE)){
+    if((csize - asize) >= (4 * DSIZE)){
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK((csize - asize), 0));
-        PUT(FTRP(bp), PACK((csize - asize), 0));
+        char *next_bp = NEXT_BLKP(bp);
+        PUT(HDRP(next_bp), PACK((csize - asize), 0));
+        PUT(FTRP(next_bp), PACK((csize - asize), 0));
     }
     else{
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
+    //printf("place: bp=%p, asize=%zu\n", bp, asize);
 }
 
 /* 
@@ -174,12 +234,13 @@ int mm_init(void)
     PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));  /* Prologue footer */
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));      /* Epilogue header */
     heap_listp += (2 * WSIZE);
+    
 
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
-    if(extend_heap(CHUNKSIZE/WSIZE) == (void *)-1){
+    if(extend_heap(CHUNKSIZE/WSIZE) == NULL){
         return -1;
     }
-
+    rover = heap_listp;
     return 0;
 }
 /* 
@@ -203,6 +264,7 @@ void *mm_malloc(size_t size)
 
     /* Search the free list for a fit */
     if((bp = find_fit(asize)) != NULL){
+        //printf("find_fit returned bp=%p, asize=%zu\n", bp, asize);
         place(bp, asize);
         return bp;
     }
@@ -272,7 +334,7 @@ void *mm_realloc(void *ptr, size_t size)
         remain = old_size - asize;
 
         /* 若剩余空间 ≥ 最小块（16字节），分割出新的空闲块 */
-        if (remain >= 2 * DSIZE) {
+        if (remain >= 4 * DSIZE) {
             /* 缩小当前块 */
             PUT(HDRP(ptr), PACK(asize, 1));
             PUT(FTRP(ptr), PACK(asize, 1));
@@ -299,9 +361,13 @@ void *mm_realloc(void *ptr, size_t size)
 
     /* 条件：后继块为空闲 且 合并后的总大小 ≥ 请求大小 */
     if (!next_alloc && total_size >= asize) {
+
+        if (rover == next_bp) {
+            rover = ptr;
+        }
         remain = total_size - asize;
 
-        if (remain >= 2 * DSIZE) {
+        if (remain >= 4 * DSIZE) {
             /* 扩展当前块到 asize */
             PUT(HDRP(ptr), PACK(asize, 1));
             PUT(FTRP(ptr), PACK(asize, 1));

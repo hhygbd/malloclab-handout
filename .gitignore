@@ -1,0 +1,5 @@
+*.o
+mdriver
+*.rep
+*.swp
+temp_traces/
